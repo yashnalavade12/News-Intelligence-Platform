@@ -1,0 +1,20 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+motor==3.4.0
+pymongo==4.7.2
+httpx==0.27.0
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+apscheduler==3.10.4
+python-multipart==0.0.9
+
+# ── Core NLP / ML ──────────────────────────────────────────
+transformers==4.41.0
+torch==2.3.0
+sentence-transformers==2.7.0   # semantic embeddings + clustering
+scikit-learn==1.5.0             # KMeans topic clustering, TF-IDF
+spacy==3.7.4                    # NER (Named Entity Recognition)
+# run after install: python -m spacy download en_core_web_sm
+numpy==1.26.4
+
