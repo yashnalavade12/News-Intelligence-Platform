@@ -98,8 +98,9 @@ def _clean_entry(entry, source_name: str) -> Optional[dict]:
 
 
 async def fetch_and_store(**kwargs) -> int:
-    """Fetch articles from RSS feeds, clean & deduplicate, store in SQLite."""
+    """Fetch articles from RSS feeds, clean & deduplicate, store in MongoDB."""
     db = get_db()
+    articles_collection = db["articles"]
     stored = 0
 
     for source_name, feed_url in RSS_FEEDS:
@@ -116,28 +117,43 @@ async def fetch_and_store(**kwargs) -> int:
             if not article:
                 continue
             try:
-                await db.execute(
-                    """INSERT OR IGNORE INTO articles
-                       (article_id, title, description, content, url, image_url,
-                        source_name, published_at, category, keywords, language,
-                        summary, sentiment, sentiment_score, entities, topics,
-                        embedding, insights, cluster_id, cluster_label, processed, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        article["article_id"], article["title"], article["description"],
-                        article["content"], article["url"], article["image_url"],
-                        article["source_name"], article["published_at"],
-                        article["category"], article["keywords"], article["language"],
-                        article["summary"], article["sentiment"], article["sentiment_score"],
-                        article["entities"], article["topics"], article["embedding"],
-                        article["insights"], article["cluster_id"], article["cluster_label"],
-                        article["processed"], article["created_at"],
-                    ),
+                # Convert JSON strings to actual objects for MongoDB
+                article_doc = {
+                    "title": article["title"],
+                    "description": article["description"],
+                    "content": article["content"],
+                    "url": article["url"],
+                    "image_url": article["image_url"],
+                    "source": article["source_name"],
+                    "published_at": article["published_at"],
+                    "category": json.loads(article["category"]),
+                    "keywords": json.loads(article["keywords"]),
+                    "language": article["language"],
+                    "summary": article["summary"],
+                    "sentiment": article["sentiment"],
+                    "sentiment_score": article["sentiment_score"],
+                    "entities": json.loads(article["entities"]),
+                    "topics": json.loads(article["topics"]),
+                    "embedding": json.loads(article["embedding"]),
+                    "insights": json.loads(article["insights"]),
+                    "cluster_id": article["cluster_id"],
+                    "cluster_label": article["cluster_label"],
+                    "processed": bool(article["processed"]),
+                    "created_at": article["created_at"],
+                }
+                
+                # Try to insert; if URL exists, skip (duplicate)
+                result = await articles_collection.update_one(
+                    {"url": article["url"]},
+                    {"$setOnInsert": article_doc},
+                    upsert=True
                 )
-                stored += 1
+                
+                if result.upserted_id or result.matched_count == 0:
+                    stored += 1
+                    
             except Exception as e:
                 print(f"⚠️ DB insert error: {e}")
 
-    await db.commit()
     print(f"✅ Fetched & stored {stored} articles from RSS feeds")
     return stored

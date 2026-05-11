@@ -5,10 +5,8 @@ import os
 
 class Settings(BaseSettings):
     FETCH_INTERVAL_MINUTES: int = 60
-    DB_PATH: str = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "data", "news.db"
-    )
+    MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+    DB_NAME: str = "newsdb"
 
     class Config:
         env_file = ".env"
