@@ -1,13 +1,26 @@
-import httpx
+"""
+RSS Feed Fetcher — replaces NewsData.io API.
+Fetches from free public RSS feeds (BBC, Ars Technica, Hacker News, etc.)
+Zero API keys needed.
+"""
+
+import feedparser
 import hashlib
+import json
 from datetime import datetime
-from typing import List, Dict, Any, Optional
-from core.config import get_settings
+from time import mktime
+from typing import Optional
 from core.database import get_db
 
-settings = get_settings()
-
-NEWSDATA_BASE = "https://newsdata.io/api/1/news"
+RSS_FEEDS = [
+    ("BBC Technology", "http://feeds.bbci.co.uk/news/technology/rss.xml"),
+    ("BBC Science", "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml"),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    ("Hacker News", "https://hnrss.org/newest?points=50&count=30"),
+    ("NASA Breaking", "https://www.nasa.gov/news-release/feed/"),
+    ("NPR Science", "https://feeds.npr.org/1007/rss.xml"),
+    ("Phys.org", "https://phys.org/rss-feed/"),
+]
 
 
 def _make_id(title: str, url: str) -> str:
@@ -15,25 +28,48 @@ def _make_id(title: str, url: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def _parse_date(date_str: Optional[str]) -> Optional[datetime]:
-    if not date_str:
-        return None
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
+def _parse_date(entry) -> Optional[str]:
+    for attr in ("published_parsed", "updated_parsed"):
+        parsed = getattr(entry, attr, None)
+        if parsed:
+            try:
+                return datetime.fromtimestamp(mktime(parsed)).isoformat()
+            except Exception:
+                continue
+    return datetime.utcnow().isoformat()
 
 
-def _clean_article(raw: Dict[str, Any]) -> Optional[Dict]:
-    title = (raw.get("title") or "").strip()
+def _clean_entry(entry, source_name: str) -> Optional[dict]:
+    title = (getattr(entry, "title", "") or "").strip()
     if not title or len(title) < 10:
         return None
 
-    url = raw.get("link") or raw.get("url") or ""
+    url = getattr(entry, "link", "") or ""
     article_id = _make_id(title, url)
 
-    content = raw.get("content") or raw.get("description") or ""
-    description = raw.get("description") or ""
+    # Get description / summary
+    description = (getattr(entry, "summary", "") or "").strip()
+    # Strip HTML tags from description
+    import re
+    description = re.sub(r"<[^>]+>", "", description).strip()
+    content = getattr(entry, "content", [{}])
+    if isinstance(content, list) and content:
+        content = content[0].get("value", description)
+    else:
+        content = description
+    content = re.sub(r"<[^>]+>", "", str(content)).strip()
+
+    # Try to get image
+    image_url = None
+    if hasattr(entry, "media_content") and entry.media_content:
+        image_url = entry.media_content[0].get("url")
+    elif hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+        image_url = entry.media_thumbnail[0].get("url")
+
+    # Get categories/tags
+    categories = []
+    if hasattr(entry, "tags"):
+        categories = [t.get("term", "") for t in entry.tags if t.get("term")]
 
     return {
         "article_id": article_id,
@@ -41,67 +77,67 @@ def _clean_article(raw: Dict[str, Any]) -> Optional[Dict]:
         "description": description[:500] if description else None,
         "content": content[:3000] if content else None,
         "url": url,
-        "image_url": raw.get("image_url"),
-        "source_name": raw.get("source_name") or raw.get("source_id"),
-        "published_at": _parse_date(raw.get("pubDate")),
-        "category": raw.get("category") or [],
-        "keywords": raw.get("keywords") or [],
-        "language": raw.get("language", "en"),
+        "image_url": image_url,
+        "source_name": source_name,
+        "published_at": _parse_date(entry),
+        "category": json.dumps(categories[:5]),
+        "keywords": json.dumps([]),
+        "language": "en",
         "summary": None,
         "sentiment": None,
         "sentiment_score": None,
-        "insights": [],
-        "processed": False,
+        "entities": json.dumps({}),
+        "topics": json.dumps([]),
+        "embedding": json.dumps([]),
+        "insights": json.dumps([]),
+        "cluster_id": None,
+        "cluster_label": None,
+        "processed": 0,
+        "created_at": datetime.utcnow().isoformat(),
     }
 
 
-async def fetch_and_store(max_pages: int = 5) -> int:
-    """Fetch articles from NewsData.io with pagination, clean & deduplicate, store in MongoDB."""
+async def fetch_and_store(**kwargs) -> int:
+    """Fetch articles from RSS feeds, clean & deduplicate, store in SQLite."""
     db = get_db()
     stored = 0
-    next_page = None
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        for _ in range(max_pages):
-            params = {
-                "apikey": settings.NEWSDATA_API_KEY,
-                "q": settings.NEWS_QUERY,
-                "language": settings.NEWS_LANGUAGE,
-                "size": 10,
-            }
-            if next_page:
-                params["page"] = next_page
+    for source_name, feed_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+            entries = feed.entries or []
+            print(f"📡 {source_name}: {len(entries)} entries")
+        except Exception as e:
+            print(f"❌ Feed error ({source_name}): {e}")
+            continue
 
+        for entry in entries:
+            article = _clean_entry(entry, source_name)
+            if not article:
+                continue
             try:
-                resp = await client.get(NEWSDATA_BASE, params=params)
-                resp.raise_for_status()
-                data = resp.json()
+                await db.execute(
+                    """INSERT OR IGNORE INTO articles
+                       (article_id, title, description, content, url, image_url,
+                        source_name, published_at, category, keywords, language,
+                        summary, sentiment, sentiment_score, entities, topics,
+                        embedding, insights, cluster_id, cluster_label, processed, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        article["article_id"], article["title"], article["description"],
+                        article["content"], article["url"], article["image_url"],
+                        article["source_name"], article["published_at"],
+                        article["category"], article["keywords"], article["language"],
+                        article["summary"], article["sentiment"], article["sentiment_score"],
+                        article["entities"], article["topics"], article["embedding"],
+                        article["insights"], article["cluster_id"], article["cluster_label"],
+                        article["processed"], article["created_at"],
+                    ),
+                )
+                stored += 1
             except Exception as e:
-                print(f"❌ Fetch error: {e}")
-                break
+                print(f"⚠️ DB insert error: {e}")
 
-            results: List[Dict] = data.get("results") or []
-            next_page = data.get("nextPage")
-
-            cleaned = [_clean_article(r) for r in results]
-            cleaned = [a for a in cleaned if a is not None]
-
-            if not cleaned:
-                break
-
-            for article in cleaned:
-                try:
-                    await db.articles.update_one(
-                        {"article_id": article["article_id"]},
-                        {"$setOnInsert": article},
-                        upsert=True,
-                    )
-                    stored += 1
-                except Exception as e:
-                    print(f"⚠️ DB insert error: {e}")
-
-            if not next_page:
-                break
-
-    print(f"✅ Fetched & stored {stored} articles")
+    await db.commit()
+    print(f"✅ Fetched & stored {stored} articles from RSS feeds")
     return stored

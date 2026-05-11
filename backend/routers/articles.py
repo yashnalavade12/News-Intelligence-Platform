@@ -1,21 +1,21 @@
+import json
 from fastapi import APIRouter, Query, HTTPException
 from typing import Optional
-from collections import Counter
-from core.database import get_db
-from models.article import PaginatedArticles, ArticleOut, StatsOut
+from core.database import get_db, row_to_dict
 from services.fetcher import fetch_and_store
 from services.ai_processor import process_unprocessed, run_topic_clustering
 
 router = APIRouter(prefix="/api/articles", tags=["articles"])
 
 
-def _serialize(doc: dict) -> dict:
-    doc["id"] = str(doc.pop("_id", ""))
-    doc.pop("embedding", None)   # never send 384-d vectors to frontend
-    return doc
+def _serialize(row) -> dict:
+    d = row_to_dict(row)
+    d["id"] = str(d.pop("id", ""))
+    d.pop("embedding", None)   # never send 384-d vectors to frontend
+    return d
 
 
-@router.get("", response_model=PaginatedArticles)
+@router.get("")
 async def get_articles(
     page: int = Query(1, ge=1),
     page_size: int = Query(12, ge=1, le=50),
@@ -25,99 +25,141 @@ async def get_articles(
     search: Optional[str] = Query(None),
 ):
     db = get_db()
-    query: dict = {"processed": True}
+    conditions = ["processed = 1"]
+    params = []
 
     if sentiment:
-        query["sentiment"] = sentiment
+        conditions.append("sentiment = ?")
+        params.append(sentiment)
     if topic:
-        query["topics.label"] = topic
+        conditions.append("EXISTS (SELECT 1 FROM json_each(topics) WHERE json_extract(value, '$.label') = ?)")
+        params.append(topic)
     if cluster_id is not None:
-        query["cluster_id"] = cluster_id
+        conditions.append("cluster_id = ?")
+        params.append(cluster_id)
     if search:
-        query["$or"] = [
-            {"title":       {"$regex": search, "$options": "i"}},
-            {"summary":     {"$regex": search, "$options": "i"}},
-            {"source_name": {"$regex": search, "$options": "i"}},
-        ]
+        conditions.append("(title LIKE ? OR summary LIKE ? OR source_name LIKE ?)")
+        like = f"%{search}%"
+        params.extend([like, like, like])
 
-    total  = await db.articles.count_documents(query)
-    skip   = (page - 1) * page_size
-    cursor = db.articles.find(query).sort("published_at", -1).skip(skip).limit(page_size)
-    docs   = await cursor.to_list(length=page_size)
+    where = " AND ".join(conditions)
 
-    return PaginatedArticles(
-        total=total, page=page, page_size=page_size,
-        articles=[_serialize(d) for d in docs],
+    # Count
+    cursor = await db.execute(f"SELECT COUNT(*) as cnt FROM articles WHERE {where}", params)
+    row = await cursor.fetchone()
+    total = row["cnt"]
+
+    # Fetch page
+    offset = (page - 1) * page_size
+    cursor = await db.execute(
+        f"SELECT * FROM articles WHERE {where} ORDER BY published_at DESC LIMIT ? OFFSET ?",
+        params + [page_size, offset],
     )
+    rows = await cursor.fetchall()
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "articles": [_serialize(r) for r in rows],
+    }
 
 
-@router.get("/stats", response_model=StatsOut)
+@router.get("/stats")
 async def get_stats():
     db = get_db()
-    total     = await db.articles.count_documents({})
-    processed = await db.articles.count_documents({"processed": True})
-    positive  = await db.articles.count_documents({"sentiment": "positive"})
-    negative  = await db.articles.count_documents({"sentiment": "negative"})
-    neutral   = await db.articles.count_documents({"sentiment": "neutral"})
-    sources   = [s for s in await db.articles.distinct("source_name") if s][:20]
 
-    # Aggregate top zero-shot topics
-    pipeline_topics = [
-        {"$match":   {"processed": True}},
-        {"$unwind":  "$topics"},
-        {"$group":   {"_id": "$topics.label", "count": {"$sum": 1}, "avg_score": {"$avg": "$topics.score"}}},
-        {"$sort":    {"count": -1}},
-        {"$limit":   8},
-    ]
+    # Basic counts
+    cur = await db.execute("SELECT COUNT(*) as c FROM articles")
+    total = (await cur.fetchone())["c"]
+
+    cur = await db.execute("SELECT COUNT(*) as c FROM articles WHERE processed = 1")
+    processed = (await cur.fetchone())["c"]
+
+    cur = await db.execute("SELECT COUNT(*) as c FROM articles WHERE sentiment = 'positive'")
+    positive = (await cur.fetchone())["c"]
+
+    cur = await db.execute("SELECT COUNT(*) as c FROM articles WHERE sentiment = 'negative'")
+    negative = (await cur.fetchone())["c"]
+
+    cur = await db.execute("SELECT COUNT(*) as c FROM articles WHERE sentiment = 'neutral'")
+    neutral = (await cur.fetchone())["c"]
+
+    cur = await db.execute(
+        "SELECT DISTINCT source_name FROM articles WHERE source_name IS NOT NULL LIMIT 20"
+    )
+    sources = [r["source_name"] for r in await cur.fetchall()]
+
+    # Top zero-shot topics (using json_each)
+    cur = await db.execute("""
+        SELECT
+            json_extract(je.value, '$.label') as label,
+            COUNT(*) as count,
+            AVG(json_extract(je.value, '$.score')) as avg_score
+        FROM articles, json_each(articles.topics) AS je
+        WHERE articles.processed = 1
+        GROUP BY label
+        ORDER BY count DESC
+        LIMIT 8
+    """)
     top_topics = [
-        {"label": r["_id"], "count": r["count"], "avg_score": round(r["avg_score"], 3)}
-        async for r in db.articles.aggregate(pipeline_topics)
+        {"label": r["label"], "count": r["count"], "avg_score": round(r["avg_score"], 3)}
+        for r in await cur.fetchall()
     ]
 
-    # Aggregate top NER entities (ORG)
-    pipeline_ner = [
-        {"$match":   {"processed": True, "entities.ORG": {"$exists": True}}},
-        {"$unwind":  "$entities.ORG"},
-        {"$group":   {"_id": "$entities.ORG", "count": {"$sum": 1}}},
-        {"$sort":    {"count": -1}},
-        {"$limit":   10},
-    ]
-    top_entities = [
-        {"name": r["_id"], "count": r["count"]}
-        async for r in db.articles.aggregate(pipeline_ner)
-    ]
+    # Top NER entities (ORG)
+    cur = await db.execute("""
+        SELECT
+            je.value as name,
+            COUNT(*) as count
+        FROM articles, json_each(json_extract(articles.entities, '$.ORG')) AS je
+        WHERE articles.processed = 1
+          AND json_extract(articles.entities, '$.ORG') IS NOT NULL
+        GROUP BY name
+        ORDER BY count DESC
+        LIMIT 10
+    """)
+    top_entities = [{"name": r["name"], "count": r["count"]} for r in await cur.fetchall()]
 
     # Cluster summary
-    pipeline_clusters = [
-        {"$match":  {"cluster_label": {"$exists": True}}},
-        {"$group":  {"_id": {"id": "$cluster_id", "label": "$cluster_label"}, "count": {"$sum": 1}}},
-        {"$sort":   {"count": -1}},
-    ]
+    cur = await db.execute("""
+        SELECT cluster_id, cluster_label, COUNT(*) as count
+        FROM articles
+        WHERE cluster_label IS NOT NULL
+        GROUP BY cluster_id, cluster_label
+        ORDER BY count DESC
+    """)
     clusters = [
-        {"id": r["_id"]["id"], "label": r["_id"]["label"], "count": r["count"]}
-        async for r in db.articles.aggregate(pipeline_clusters)
+        {"id": r["cluster_id"], "label": r["cluster_label"], "count": r["count"]}
+        for r in await cur.fetchall()
     ]
 
-    return StatsOut(
-        total_articles=total, processed_articles=processed,
-        positive=positive, negative=negative, neutral=neutral,
-        sources=sources, top_topics=top_topics,
-        top_entities=top_entities, clusters=clusters,
-    )
+    return {
+        "total_articles": total,
+        "processed_articles": processed,
+        "positive": positive,
+        "negative": negative,
+        "neutral": neutral,
+        "sources": sources,
+        "top_topics": top_topics,
+        "top_entities": top_entities,
+        "clusters": clusters,
+    }
 
 
-@router.get("/{article_id}", response_model=ArticleOut)
+@router.get("/{article_id}")
 async def get_article(article_id: str):
-    db  = get_db()
-    doc = await db.articles.find_one({"article_id": article_id})
-    if not doc:
+    db = get_db()
+    cursor = await db.execute("SELECT * FROM articles WHERE article_id = ?", (article_id,))
+    row = await cursor.fetchone()
+    if not row:
         raise HTTPException(status_code=404, detail="Article not found")
-    return _serialize(doc)
+    return _serialize(row)
 
 
 @router.post("/pipeline/run")
 async def trigger_pipeline():
-    fetched   = await fetch_and_store(max_pages=5)
+    fetched   = await fetch_and_store()
     processed = await process_unprocessed(batch_size=50)
     await run_topic_clustering(n_clusters=8)
     return {"fetched": fetched, "processed": processed, "status": "ok"}

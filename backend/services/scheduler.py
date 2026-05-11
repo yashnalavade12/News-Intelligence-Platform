@@ -9,7 +9,7 @@ scheduler = AsyncIOScheduler()
 
 async def _pipeline_job():
     print("🔄 Running scheduled pipeline …")
-    await fetch_and_store(max_pages=5)
+    await fetch_and_store()
     await process_unprocessed(batch_size=50)
 
 

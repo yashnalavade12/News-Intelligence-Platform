@@ -221,19 +221,18 @@ async def run_topic_clustering(n_clusters: int = 8) -> Dict[str, Any]:
     from sklearn.feature_extraction.text import TfidfVectorizer
 
     db = get_db()
-    cursor = db.articles.find(
-        {"embedding": {"$exists": True, "$ne": []}, "processed": True},
-        {"_id": 1, "embedding": 1, "title": 1, "summary": 1}
+    cursor = await db.execute(
+        "SELECT id, embedding, title, summary FROM articles WHERE embedding != '[]' AND processed = 1"
     )
-    docs = await cursor.to_list(length=2000)
+    rows = await cursor.fetchall()
 
-    if len(docs) < n_clusters:
-        print(f"⚠️ Not enough articles for clustering ({len(docs)})")
+    if len(rows) < n_clusters:
+        print(f"⚠️ Not enough articles for clustering ({len(rows)})")
         return {}
 
-    ids      = [d["_id"]      for d in docs]
-    vecs     = np.array([d["embedding"] for d in docs], dtype="float32")
-    texts    = [f"{d.get('title','')} {d.get('summary','')}" for d in docs]
+    ids = [r["id"] for r in rows]
+    vecs = np.array([json.loads(r["embedding"]) for r in rows], dtype="float32")
+    texts = [f"{r['title'] or ''} {r['summary'] or ''}" for r in rows]
 
     # KMeans clustering
     km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -256,12 +255,13 @@ async def run_topic_clustering(n_clusters: int = 8) -> Dict[str, Any]:
 
     # Write back to DB
     for doc_id, cluster_id in zip(ids, labels):
-        await db.articles.update_one(
-            {"_id": doc_id},
-            {"$set": {"cluster_id": int(cluster_id), "cluster_label": cluster_names[int(cluster_id)]}}
+        await db.execute(
+            "UPDATE articles SET cluster_id = ?, cluster_label = ? WHERE id = ?",
+            (int(cluster_id), cluster_names[int(cluster_id)], doc_id),
         )
+    await db.commit()
 
-    print(f"✅ Clustered {len(docs)} articles into {n_clusters} topics")
+    print(f"✅ Clustered {len(rows)} articles into {n_clusters} topics")
     return cluster_names
 
 
@@ -270,8 +270,10 @@ async def run_topic_clustering(n_clusters: int = 8) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 async def process_unprocessed(batch_size: int = 20) -> int:
     db = get_db()
-    cursor = db.articles.find({"processed": False}).limit(batch_size)
-    articles = await cursor.to_list(length=batch_size)
+    cursor = await db.execute(
+        "SELECT * FROM articles WHERE processed = 0 LIMIT ?", (batch_size,)
+    )
+    articles = await cursor.fetchall()
 
     if not articles:
         print("ℹ️  No unprocessed articles.")
@@ -279,9 +281,12 @@ async def process_unprocessed(batch_size: int = 20) -> int:
 
     count = 0
     for article in articles:
-        raw = article.get("content") or article.get("description") or article.get("title") or ""
-        title    = article.get("title", "")
-        keywords = article.get("keywords") or []
+        raw = article["content"] or article["description"] or article["title"] or ""
+        title = article["title"] or ""
+        try:
+            keywords = json.loads(article["keywords"]) if article["keywords"] else []
+        except (json.JSONDecodeError, TypeError):
+            keywords = []
 
         # Run all ML stages
         summary   = _summarize(raw)
@@ -291,20 +296,20 @@ async def process_unprocessed(batch_size: int = 20) -> int:
         embedding = _embed(f"{title}. {summary}")
         insights  = _build_insights(summary, entities, topics, keywords)
 
-        await db.articles.update_one(
-            {"_id": article["_id"]},
-            {"$set": {
-                "summary":         summary,
-                "sentiment":       sentiment,
-                "sentiment_score": sent_score,
-                "entities":        entities,
-                "topics":          topics,
-                "embedding":       embedding,
-                "insights":        insights,
-                "processed":       True,
-            }}
+        await db.execute(
+            """UPDATE articles SET
+                summary = ?, sentiment = ?, sentiment_score = ?,
+                entities = ?, topics = ?, embedding = ?,
+                insights = ?, processed = 1
+               WHERE id = ?""",
+            (
+                summary, sentiment, sent_score,
+                json.dumps(entities), json.dumps(topics), json.dumps(embedding),
+                json.dumps(insights), article["id"],
+            ),
         )
         count += 1
 
+    await db.commit()
     print(f"✅ ML-processed {count} articles")
     return count
